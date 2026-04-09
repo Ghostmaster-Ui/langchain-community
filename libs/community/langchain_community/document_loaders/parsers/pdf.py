@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import io
 import logging
+import mmap
 import threading
 import warnings
 from datetime import datetime
@@ -379,24 +380,35 @@ class PyPDFParser(BaseBlobParser):
                 )
 
         import os
-
-        # Prefer reading directly from disk when the source path exists, to avoid
-        # loading the entire file into memory via blob.as_bytes_io().
+        # Use memory-mapped I/O when a real file path is available.
+        # mmap lets the OS page file data on demand — the PDF bytes are never
+        # copied into the Python heap, giving zero-copy streaming behaviour and
+        # substantially lower peak RSS for large documents.
         pdf_reader: Optional[pypdf.PdfReader] = None
+        _mmap_obj: Optional[mmap.mmap] = None
+        _file_obj = None
         if (
             blob.source
             and isinstance(blob.source, str)
             and os.path.exists(blob.source)
         ):
             try:
-                pdf_reader = pypdf.PdfReader(blob.source, password=self.password)
+                _file_obj = open(blob.source, "rb")
+                _mmap_obj = mmap.mmap(
+                    _file_obj.fileno(), length=0, access=mmap.ACCESS_READ
+                )
+                pdf_reader = pypdf.PdfReader(_mmap_obj, password=self.password)
             except Exception:
+                if _mmap_obj is not None:
+                    _mmap_obj.close()
+                    _mmap_obj = None
+                if _file_obj is not None:
+                    _file_obj.close()
+                    _file_obj = None
                 pdf_reader = None
-
         if pdf_reader is None:
             with blob.as_bytes_io() as pdf_file_obj:
                 pdf_reader = pypdf.PdfReader(pdf_file_obj, password=self.password)
-
         assert pdf_reader is not None, "Failed to read PDF with pypdf."
 
         doc_metadata = _purge_metadata(
@@ -448,6 +460,11 @@ class PyPDFParser(BaseBlobParser):
                 page_content=single_buf.getvalue(),
                 metadata=_validate_metadata(doc_metadata),
             )
+        # Release memory-mapped resources now that parsing is complete.
+        if _mmap_obj is not None:
+            _mmap_obj.close()
+        if _file_obj is not None:
+            _file_obj.close()
 
     def extract_images_from_page(self, page: pypdf._page.PageObject) -> str:
         """Extract images from a PDF page and get the text using images_to_text.
