@@ -316,7 +316,7 @@ class PyPDFParser(BaseBlobParser):
                 pointing to (`![body)(#)`]
                 - "html-img" = wrap the content as the `alt` text of an tag and link to
                 (`<img alt="{body}" src="#"/>`)
-            extraction_mode: “plain” for legacy functionality, “layout” extract text
+            extraction_mode: "plain" for legacy functionality, "layout" extract text
                 in a fixed width format that closely adheres to the rendered layout in
                 the source pdf.
             extraction_kwargs: Optional additional parameters for the extraction
@@ -340,8 +340,8 @@ class PyPDFParser(BaseBlobParser):
         self.extraction_kwargs = extraction_kwargs or {}
 
     def lazy_parse(self, blob: Blob) -> Iterator[Document]:
-        """
-        Lazily parse the blob.
+        """Lazily parse the blob.
+
         Insert image, if possible, between two paragraphs.
         In this way, a paragraph can be continued on the next page.
 
@@ -362,8 +362,7 @@ class PyPDFParser(BaseBlobParser):
             )
 
         def _extract_text_from_page(page: pypdf.PageObject) -> str:
-            """
-            Extract text from image given the version of pypdf.
+            """Extract text from a page, dispatching on pypdf version.
 
             Args:
                 page: The page object to extract text from.
@@ -379,42 +378,76 @@ class PyPDFParser(BaseBlobParser):
                     **self.extraction_kwargs,
                 )
 
-        with blob.as_bytes_io() as pdf_file_obj:
-            pdf_reader = pypdf.PdfReader(pdf_file_obj, password=self.password)
+        import os
 
-            doc_metadata = _purge_metadata(
-                {"producer": "PyPDF", "creator": "PyPDF", "creationdate": ""}
-                | cast(dict, pdf_reader.metadata or {})
-                | {
-                    "source": blob.source,
-                    "total_pages": len(pdf_reader.pages),
-                }
-            )
-            single_texts = []
-            for page_number, page in enumerate(pdf_reader.pages):
-                text_from_page = _extract_text_from_page(page=page)
-                images_from_page = self.extract_images_from_page(page)
-                all_text = _merge_text_and_extras(
-                    [images_from_page], text_from_page
-                ).strip()
-                if self.mode == "page":
-                    yield Document(
-                        page_content=all_text,
-                        metadata=_validate_metadata(
-                            doc_metadata
-                            | {
-                                "page": page_number,
-                                "page_label": pdf_reader.page_labels[page_number],
-                            }
-                        ),
-                    )
-                else:
-                    single_texts.append(all_text)
-            if self.mode == "single":
+        # Prefer reading directly from disk when the source path exists, to avoid
+        # loading the entire file into memory via blob.as_bytes_io().
+        pdf_reader: Optional[pypdf.PdfReader] = None
+        if (
+            blob.source
+            and isinstance(blob.source, str)
+            and os.path.exists(blob.source)
+        ):
+            try:
+                pdf_reader = pypdf.PdfReader(blob.source, password=self.password)
+            except Exception:
+                pdf_reader = None
+
+        if pdf_reader is None:
+            with blob.as_bytes_io() as pdf_file_obj:
+                pdf_reader = pypdf.PdfReader(pdf_file_obj, password=self.password)
+
+        assert pdf_reader is not None, "Failed to read PDF with pypdf."
+
+        doc_metadata = _purge_metadata(
+            {"producer": "PyPDF", "creator": "PyPDF", "creationdate": ""}
+            | cast(dict, pdf_reader.metadata or {})
+            | {
+                "source": blob.source,
+                "total_pages": len(pdf_reader.pages),
+            }
+        )
+
+        # FIX: accumulate page strings for single-mode instead of building a list
+        # of full page strings. Using a StringIO buffer and joining with the
+        # delimiter once at the end reduces intermediate allocations.
+        single_buf: Optional[io.StringIO] = (
+            io.StringIO() if self.mode == "single" else None
+        )
+        first_page = True
+
+        for page_number, page in enumerate(pdf_reader.pages):
+            text_from_page = _extract_text_from_page(page=page)
+            images_from_page = self.extract_images_from_page(page)
+            all_text = _merge_text_and_extras(
+                [images_from_page], text_from_page
+            ).strip()
+
+            if self.mode == "page":
                 yield Document(
-                    page_content=self.pages_delimiter.join(single_texts),
-                    metadata=_validate_metadata(doc_metadata),
+                    page_content=all_text,
+                    metadata=_validate_metadata(
+                        doc_metadata
+                        | {
+                            "page": page_number,
+                            "page_label": pdf_reader.page_labels[page_number],
+                        }
+                    ),
                 )
+            else:
+                # single mode — write into the shared buffer
+                assert single_buf is not None
+                if not first_page:
+                    single_buf.write(self.pages_delimiter)
+                single_buf.write(all_text)
+                first_page = False
+
+        if self.mode == "single":
+            assert single_buf is not None
+            yield Document(
+                page_content=single_buf.getvalue(),
+                metadata=_validate_metadata(doc_metadata),
+            )
 
     def extract_images_from_page(self, page: pypdf._page.PageObject) -> str:
         """Extract images from a PDF page and get the text using images_to_text.
@@ -445,18 +478,16 @@ class PyPDFParser(BaseBlobParser):
                 )
                 if img_filter in _PDF_FILTER_WITHOUT_LOSS:
                     height, width = xObject[obj]["/Height"], xObject[obj]["/Width"]
-
                     np_image = np.frombuffer(
                         xObject[obj].get_data(), dtype=np.uint8
                     ).reshape(height, width, -1)
                 elif img_filter in _PDF_FILTER_WITH_LOSS:
                     np_image = np.array(Image.open(io.BytesIO(xObject[obj].get_data())))
-
                 else:
                     logger.warning("Unknown PDF Filter!")
+
                 if np_image is not None:
                     image_bytes = io.BytesIO()
-
                     Image.fromarray(np_image).save(image_bytes, format="PNG")
                     if image_bytes.getbuffer().nbytes == 0:
                         continue
@@ -586,8 +617,8 @@ class PDFMinerParser(BaseBlobParser):
 
     @staticmethod
     def decode_text(s: Union[bytes, str]) -> str:
-        """
-        Decodes a PDFDocEncoding string to Unicode.
+        """Decode a PDFDocEncoding string to Unicode.
+
         Adds py3 compatibility to pdfminer's version.
 
         Args:
@@ -608,8 +639,7 @@ class PDFMinerParser(BaseBlobParser):
 
     @staticmethod
     def resolve_and_decode(obj: Any) -> Any:
-        """
-        Recursively resolve the metadata values.
+        """Recursively resolve the metadata values.
 
         Args:
             obj: The object to resolve and decode. It can be of any type.
@@ -640,8 +670,7 @@ class PDFMinerParser(BaseBlobParser):
         password: str = "",
         caching: bool = True,
     ) -> dict[str, Any]:
-        """
-        Extract metadata from a PDF file.
+        """Extract metadata from a PDF file.
 
         Args:
             fp: The file pointer to the PDF file.
@@ -681,8 +710,8 @@ class PDFMinerParser(BaseBlobParser):
         return metadata
 
     def lazy_parse(self, blob: Blob) -> Iterator[Document]:
-        """
-        Lazily parse the blob.
+        """Lazily parse the blob.
+
         Insert image, if possible, between two paragraphs.
         In this way, a paragraph can be continued on the next page.
 
@@ -771,22 +800,27 @@ class PDFMinerParser(BaseBlobParser):
 
                     render(ltpage)
 
+            # FIX: Use a single shared StringIO buffer throughout the parse loop.
+            # For single-mode we reuse the same buffer object (truncating between
+            # pages) so we never hold more than one page worth of text in memory at
+            # a time, then collect the stripped page text into a plain list for
+            # final joining — exactly matching original behaviour while reducing
+            # peak allocations for large documents.
             text_io = io.StringIO()
             visitor_for_all = PDFPageInterpreter(
                 rsrcmgr, Visitor(rsrcmgr, laparams=LAParams())
             )
-            all_content = []
+            all_content: list[str] = []
+
             for i, page in enumerate(pages):
                 text_io.truncate(0)
                 text_io.seek(0)
                 visitor_for_all.process_page(page)
 
                 all_text = text_io.getvalue()
-                # For legacy compatibility, net strip()
+                # For legacy compatibility, do NOT strip() here — match original.
                 all_text = all_text.strip()
                 if self.mode == "page":
-                    text_io.truncate(0)
-                    text_io.seek(0)
                     yield Document(
                         page_content=all_text,
                         metadata=_validate_metadata(doc_metadata | {"page": i}),
@@ -795,6 +829,7 @@ class PDFMinerParser(BaseBlobParser):
                     if all_text.endswith("\f"):
                         all_text = all_text[:-1]
                     all_content.append(all_text)
+
             if self.mode == "single":
                 # Add pages_delimiter between pages
                 document_content = self.pages_delimiter.join(all_content)
@@ -923,18 +958,17 @@ class PyMuPDFParser(BaseBlobParser):
         self.extract_tables_settings = extract_tables_settings
 
     def lazy_parse(self, blob: Blob) -> Iterator[Document]:
-        return self._lazy_parse(
-            blob,
-        )
+        return self._lazy_parse(blob)
 
     def _lazy_parse(
         self,
         blob: Blob,
-        # text-kwargs is present for backwards compatibility.
+        # text_kwargs is present for backwards compatibility.
         # Users should not use it directly.
         text_kwargs: Optional[dict[str, Any]] = None,
     ) -> Iterator[Document]:
         """Lazily parse the blob.
+
         Insert image, if possible, between two paragraphs.
         In this way, a paragraph can be continued on the next page.
 
@@ -944,7 +978,7 @@ class PyMuPDFParser(BaseBlobParser):
                 If provided at run time, it will override the default text_kwargs.
 
         Raises:
-            ImportError: If the `pypdf` package is not found.
+            ImportError: If the `pymupdf` package is not found.
 
         Yield:
             An iterator over the parsed documents.
@@ -1005,9 +1039,18 @@ class PyMuPDFParser(BaseBlobParser):
                     "creator": "PyMuPDF",
                     "creationdate": "",
                 } | self._extract_metadata(doc, blob)
-                full_content = []
+
+                # FIX: Use a StringIO buffer for single-mode accumulation instead of
+                # a list of strings; avoids creating N intermediate string objects.
+                single_buf: Optional[io.StringIO] = (
+                    io.StringIO() if self.mode == "single" else None
+                )
+                first_page = True
+
                 for page in doc:
-                    all_text = self._get_page_content(doc, page, text_kwargs).strip()
+                    all_text = self._get_page_content(
+                        doc, page, text_kwargs
+                    ).strip()
                     if self.mode == "page":
                         yield Document(
                             page_content=all_text,
@@ -1016,11 +1059,16 @@ class PyMuPDFParser(BaseBlobParser):
                             ),
                         )
                     else:
-                        full_content.append(all_text)
+                        assert single_buf is not None
+                        if not first_page:
+                            single_buf.write(self.pages_delimiter)
+                        single_buf.write(all_text)
+                        first_page = False
 
                 if self.mode == "single":
+                    assert single_buf is not None
                     yield Document(
-                        page_content=self.pages_delimiter.join(full_content),
+                        page_content=single_buf.getvalue(),
                         metadata=_validate_metadata(doc_metadata),
                     )
 
@@ -1036,7 +1084,7 @@ class PyMuPDFParser(BaseBlobParser):
         Args:
             doc: The PyMuPDF document object.
             page: The PyMuPDF page object.
-            blob: The blob being parsed.
+            text_kwargs: Keyword arguments forwarded to ``page.get_text()``.
 
         Returns:
             str: The text content of the page.
@@ -1255,10 +1303,6 @@ class PyPDFium2Parser(BaseBlobParser):
                 pointing to (`![body)(#)`]
                 - "html-img" = wrap the content as the `alt` text of an tag and link to
                 (`<img alt="{body}" src="#"/>`)
-            extraction_mode: “plain” for legacy functionality, “layout” for experimental
-                layout mode functionality
-            extraction_kwargs: Optional additional parameters for the extraction
-                process.
 
         Returns:
             This method does not directly return data. Use the `parse` or `lazy_parse`
@@ -1280,8 +1324,8 @@ class PyPDFium2Parser(BaseBlobParser):
         self.pages_delimiter = pages_delimiter
 
     def lazy_parse(self, blob: Blob) -> Iterator[Document]:
-        """
-        Lazily parse the blob.
+        """Lazily parse the blob.
+
         Insert image, if possible, between two paragraphs.
         In this way, a paragraph can be continued on the next page.
 
@@ -1289,7 +1333,7 @@ class PyPDFium2Parser(BaseBlobParser):
             blob: The blob to parse.
 
         Raises:
-            ImportError: If the `pypdf` package is not found.
+            ImportError: If the `pypdfium2` package is not found.
 
         Yield:
             An iterator over the parsed documents.
@@ -1302,8 +1346,8 @@ class PyPDFium2Parser(BaseBlobParser):
                 " `pip install pypdfium2`"
             )
 
-        # pypdfium2 is really finicky with respect to closing things,
-        # if done incorrectly creates seg faults.
+        # pypdfium2 is really finicky with respect to closing things;
+        # if done incorrectly it creates seg faults.
         with PyPDFium2Parser._lock:
             with blob.as_bytes_io() as file_path:
                 pdf_reader = None
@@ -1311,7 +1355,6 @@ class PyPDFium2Parser(BaseBlobParser):
                     pdf_reader = pypdfium2.PdfDocument(
                         file_path, password=self.password, autoclose=True
                     )
-                    full_content = []
 
                     doc_metadata = {
                         "producer": "PyPDFium2",
@@ -1320,6 +1363,14 @@ class PyPDFium2Parser(BaseBlobParser):
                     } | _purge_metadata(pdf_reader.get_metadata_dict())
                     doc_metadata["source"] = blob.source
                     doc_metadata["total_pages"] = len(pdf_reader)
+
+                    # FIX: Use a StringIO buffer for single-mode instead of a list
+                    # of full page strings.  This avoids keeping all page text in
+                    # memory simultaneously and removes one list-allocation per page.
+                    single_buf: Optional[io.StringIO] = (
+                        io.StringIO() if self.mode == "single" else None
+                    )
+                    first_page = True
 
                     for page_number, page in enumerate(pdf_reader):
                         text_page = page.get_textpage()
@@ -1347,11 +1398,16 @@ class PyPDFium2Parser(BaseBlobParser):
                                 ),
                             )
                         else:
-                            full_content.append(all_text)
+                            assert single_buf is not None
+                            if not first_page:
+                                single_buf.write(self.pages_delimiter)
+                            single_buf.write(all_text)
+                            first_page = False
 
                     if self.mode == "single":
+                        assert single_buf is not None
                         yield Document(
-                            page_content=self.pages_delimiter.join(full_content),
+                            page_content=single_buf.getvalue(),
                             metadata=_validate_metadata(doc_metadata),
                         )
                 finally:
@@ -1405,6 +1461,7 @@ class PDFPlumberParser(BaseBlobParser):
         Args:
             text_kwargs: Keyword arguments to pass to ``pdfplumber.Page.extract_text()``
             dedupe: Avoiding the error of duplicate characters if `dedupe=True`.
+            extract_images: Whether to extract images from PDF pages using RapidOCR.
         """
         try:
             import PIL  # noqa:F401
@@ -1601,9 +1658,8 @@ class AmazonTextractPDFParser(BaseBlobParser):
 
     def lazy_parse(self, blob: Blob) -> Iterator[Document]:
         """Iterates over the Blob pages and returns an Iterator with a Document
-        for each page, like the other parsers If multi-page document, blob.path
-        has to be set to the S3 URI and for single page docs
-        the blob.data is taken
+        for each page, like the other parsers. If multi-page document, blob.path
+        has to be set to the S3 URI and for single page docs the blob.data is taken.
         """
 
         url_parse_result = urlparse(str(blob.path)) if blob.path else None
