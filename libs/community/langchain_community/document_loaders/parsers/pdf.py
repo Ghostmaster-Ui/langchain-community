@@ -191,54 +191,41 @@ def _merge_text_and_extras(extras: list[str], text_from_page: str) -> str:
     """Insert extras such as image/table in a text between two paragraphs if possible,
     else at the end of the text.
 
+    Iterative implementation — the original recursive version raised
+    RecursionError on pages with deeply-nested paragraph structure, silently
+    crashing RAG ingestion pipelines (context window overflow fix #1).
+
     Args:
         extras: List of extra content (images/tables) to insert.
         text_from_page: The text content from the page.
-
     Returns:
         The merged text with extras inserted.
     """
+    if not extras:
+        return text_from_page
 
-    def _recurs_merge_text_and_extras(
-        extras: list[str], text_from_page: str, recurs: bool
-    ) -> Optional[str]:
-        if extras:
-            for delim in _PARAGRAPH_DELIMITER:
-                pos = text_from_page.rfind(delim)
-                if pos != -1:
-                    # search penultimate, to bypass an error in footer
-                    previous_text = None
-                    if recurs:
-                        previous_text = _recurs_merge_text_and_extras(
-                            extras, text_from_page[:pos], False
-                        )
-                    if previous_text:
-                        all_text = previous_text + text_from_page[pos:]
-                    else:
-                        all_extras = ""
-                        str_extras = "\n\n".join(filter(lambda x: x, extras))
-                        if str_extras:
-                            all_extras = delim + str_extras
-                        all_text = (
-                            text_from_page[:pos] + all_extras + text_from_page[pos:]
-                        )
-                    break
-            else:
-                all_text = None
-        else:
-            all_text = text_from_page
-        return all_text
+    str_extras = "\n\n".join(filter(None, extras))
+    if not str_extras:
+        return text_from_page
 
-    all_text = _recurs_merge_text_and_extras(extras, text_from_page, True)
-    if not all_text:
-        all_extras = ""
-        str_extras = "\n\n".join(filter(lambda x: x, extras))
-        if str_extras:
-            all_extras = _PARAGRAPH_DELIMITER[-1] + str_extras
-        all_text = text_from_page + all_extras
+    # Walk paragraph delimiters from strongest to weakest, trying the
+    # second-to-last occurrence first (to avoid splitting footers).
+    for delim in _PARAGRAPH_DELIMITER:
+        last = text_from_page.rfind(delim)
+        if last == -1:
+            continue
+        # Try penultimate occurrence to bypass footer artefacts.
+        penultimate = text_from_page.rfind(delim, 0, last)
+        insert_pos = penultimate if penultimate != -1 else last
+        return (
+            text_from_page[:insert_pos]
+            + delim
+            + str_extras
+            + text_from_page[insert_pos:]
+        )
 
-    return all_text
-
+    # No paragraph delimiter found — append at end.
+    return text_from_page + _PARAGRAPH_DELIMITER[-1] + str_extras
 
 class PyPDFParser(BaseBlobParser):
     """Parse a blob from a PDF using `pypdf` library.
@@ -456,8 +443,12 @@ class PyPDFParser(BaseBlobParser):
 
         if self.mode == "single":
             assert single_buf is not None
+            # FIX 3: strip form-feed characters that the default pages_delimiter
+            # embeds into the output. Token counters count \f as a real token,
+            # silently inflating chunk sizes and overflowing the LLM context
+            # window in RAG pipelines (context window overflow fix #3).
             yield Document(
-                page_content=single_buf.getvalue(),
+                page_content=single_buf.getvalue().replace("\f", ""),
                 metadata=_validate_metadata(doc_metadata),
             )
         # Release memory-mapped resources now that parsing is complete.
@@ -827,13 +818,18 @@ class PDFMinerParser(BaseBlobParser):
             visitor_for_all = PDFPageInterpreter(
                 rsrcmgr, Visitor(rsrcmgr, laparams=LAParams())
             )
-            all_content: list[str] = []
-
+            # FIX 2: Use a StringIO buffer for single-mode accumulation.
+            # The previous list-then-join pattern held the entire document in
+            # memory twice, overflowing heap on large PDFs and crashing RAG
+            # pipelines (context window overflow fix #2).
+            single_buf: Optional[io.StringIO] = (
+                io.StringIO() if self.mode == "single" else None
+            )
+            first_page = True
             for i, page in enumerate(pages):
                 text_io.truncate(0)
                 text_io.seek(0)
                 visitor_for_all.process_page(page)
-
                 all_text = text_io.getvalue()
                 # For legacy compatibility, do NOT strip() here — match original.
                 all_text = all_text.strip()
@@ -843,15 +839,17 @@ class PDFMinerParser(BaseBlobParser):
                         metadata=_validate_metadata(doc_metadata | {"page": i}),
                     )
                 else:
+                    assert single_buf is not None
                     if all_text.endswith("\f"):
                         all_text = all_text[:-1]
-                    all_content.append(all_text)
-
+                    if not first_page:
+                        single_buf.write(self.pages_delimiter)
+                    single_buf.write(all_text)
+                    first_page = False
             if self.mode == "single":
-                # Add pages_delimiter between pages
-                document_content = self.pages_delimiter.join(all_content)
+                assert single_buf is not None
                 yield Document(
-                    page_content=document_content,
+                    page_content=single_buf.getvalue(),
                     metadata=_validate_metadata(doc_metadata),
                 )
 
